@@ -232,15 +232,15 @@ def draw_detections_on_image(img, bboxes=[SnpxBbox()], box_color = (255, 0, 0)):
 
 class OpenVinoInference(object):
     """ Inference with openvino. """
-    def __init__(self, device_name='MYRIAD', model_name='yolov3_320'):
+    def __init__(self, device_name='MYRIAD', model_name='/ho'):
         """ """
         print ('Device: ', device_name)
 
         # Open Graph File
-        self.input_size = (320, 320)
+        self.input_size = (416, 416)
         model_xml = model_name + '.xml'
         model_bin = model_name + '.bin'
-        self._postprocessor = TFYoloV3Postprocessor(0.4, 0.5)
+        self._postprocessor = TFYoloV3Postprocessor(0.4, 0.8, self.input_size)
         if not os.path.exists(model_xml) or not os.path.exists(model_bin): 
             raise ValueError('OpenVino Model Graph Missing <%s>'%model_xml)
 
