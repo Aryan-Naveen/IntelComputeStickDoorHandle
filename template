@@ -1,0 +1,295 @@
+"""
+vino_inference
+==============
+Inference Engine based on the Intel OpenVINO toolkit for NCS device
+"""
+import os
+import time
+import cv2
+import numpy as np
+from openvino.inference_engine import IENetwork, IEPlugin
+
+############### POST-PROCESSING CODE ###############
+class SnpxBbox:
+    """ """
+    def __init__(self, box_class='', class_id=0, box=[], confidence=0.0):
+        self.box = box
+        self.class_id = class_id
+        self.box_class = box_class
+        self.confidence = confidence
+
+def np_sigmoid(x):
+    """ Sigmoid in Numpy. """
+    return 1/(1 + np.exp(-x))
+
+def bbox_iou(bbox1, bbox2):
+    """ compute intersection over union score """
+    x_min1, y_min1, x_max1, y_max1 = bbox1
+    x_min2, y_min2, x_max2, y_max2 = bbox2
+    min_ymax = min(y_max1, y_max2)
+    max_ymin = max(y_min1, y_min2)
+    min_xmax = min(x_max1, x_max2)
+    max_xmin = max(x_min1, x_min2)
+    h = max(0.0, min_ymax - max_ymin)
+    w = max(0.0, min_xmax - max_xmin)
+    inter = h * w
+    area1 = (y_max1 - y_min1) * (x_max1 - x_min1)
+    area2 = (y_max2 - y_min2) * (x_max2 - x_min2)
+    union = area1 + area2 - inter
+    return inter / union
+
+def non_max_suppression(bboxes, iou_thresh=0.7):
+    """ Suppress low-scoring overlapped boxes """
+    bboxes = sorted(bboxes, key=lambda box: box.confidence, reverse=True)
+    out_bboxes = []
+    for i, bbox in enumerate(bboxes):
+        if bbox.confidence > 0:
+            for bbox_j in bboxes[i+1::]:
+                if bbox.class_id == bbox_j.class_id:
+                    iou = bbox_iou(bbox.box, bbox_j.box)
+                    if iou > iou_thresh:
+                        bbox_j.confidence = 0
+            out_bboxes.append(bbox)
+    return out_bboxes
+
+class TFYoloV3Postprocessor(object):
+    """ """
+    def __init__(self, nms_iou_thresh=0.7, confidence_thresh=0.2, input_size=(320, 320)):
+        self.input_size = input_size
+        self.nms_iou_thresh = nms_iou_thresh
+        self.confidence_thresh = confidence_thresh
+        self.detect_layers = [
+            {
+                'name'        : 'detect_1',
+                'stride'      : (32, 32),
+                'base_anchors': [(116, 90), (156, 198), (373, 326)]
+            },
+            {
+                'name'        : 'detect_2',
+                'stride'      : (16, 16),
+                'base_anchors': [(30, 61), (62, 45), (59, 119)]
+            },
+            {
+                'name'        : 'detect_3',
+                'stride'      : (8, 8),
+                'base_anchors': [(10, 13), (16, 30), (33, 23)]
+            }
+        ]
+        self._split_idx = []
+        self._gen_anchors()
+
+    def _gen_anchors(self):
+        """ Generate YOLOv3 Anchor Boxes."""
+        offset = 0
+        for layer in self.detect_layers:
+            anchors   = layer['base_anchors']
+            stride    = layer['stride']
+            grid_size = (self.input_size[0] // stride[0],  self.input_size[1] // stride[1])
+            num_anchors = len(anchors)
+
+            dim = grid_size[0] * grid_size[1]
+            anchors = np.tile(anchors, [dim, 1])
+
+            grid_x = np.arange(grid_size[0], dtype=np.float32)
+            grid_y = np.arange(grid_size[1], dtype=np.float32)
+            a, b = np.meshgrid(grid_x, grid_y)
+            x_offset = np.reshape(a, [-1, 1])
+            y_offset = np.reshape(b, [-1, 1])
+            x_y_offset = np.concatenate((x_offset, y_offset), axis=-1)
+            x_y_offset = np.reshape(np.tile(x_y_offset, [1, num_anchors]), [1, -1, 2])
+
+            layer['offset']  = np.squeeze(x_y_offset, 0)
+            layer['anchors'] = anchors
+
+            offset += dim * num_anchors
+            self._split_idx.append(offset)
+
+        self._split_idx = self._split_idx[:-1]
+    
+    def _prediction_postprocess(self, net_out):
+        """ """
+        conf        = []
+        boxes       = []
+        class_probs = []
+        layer_predictions = np.split(net_out, self._split_idx, axis=0)
+        for i, pred in enumerate(layer_predictions):
+            stride  = self.detect_layers[i]['stride']
+            offset  = self.detect_layers[i]['offset']
+            anchors = self.detect_layers[i]['anchors']
+            box_centers, box_sizes, confidence, classes = np.split(pred, [2, 4, 5], axis=-1)
+
+            classes = np_sigmoid(classes)
+            confidence = np_sigmoid(confidence)
+            box_centers = np_sigmoid(box_centers)
+            box_centers = box_centers + offset
+            box_centers = box_centers * stride
+    
+            box_sizes = np.exp(box_sizes) * anchors
+            bboxes = np.concatenate((box_centers, box_sizes), axis=-1)
+
+            boxes.append(bboxes)
+            conf.append(confidence)
+            class_probs.append(classes)
+
+        conf = np.concatenate(conf, axis=0)
+        boxes = np.concatenate(boxes, axis=0)
+        class_probs = np.concatenate(class_probs, axis=0)
+        return boxes, conf, class_probs
+
+    def __call__(self, image, net_out):
+        """
+        """
+        classes =  [
+            'person', 'bicycle', 'car', 'motorbike', 'aeroplane', 'bus', 'train', 'truck', 'boat', 
+            'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 
+            'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 
+            'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 
+            'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 
+            'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 
+            'sofa', 'pottedplant', 'bed', 'diningtable', 'toilet', 'tvmonitor', 'laptop', 'mouse', 
+            'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 
+            'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush']
+
+        if isinstance(net_out, list): net_out = net_out[0]
+
+        # Combine boxes from different output feature layers
+        boxes, conf, class_probs = self._prediction_postprocess(net_out)
+
+        # Get boxes with high confidence
+        class_ids = np.argmax(class_probs, axis=-1).reshape(conf.shape)
+        class_probs = np.max(class_probs, axis=-1).reshape(conf.shape)
+        idx = np.where(conf > self.confidence_thresh)
+        conf = conf[idx]
+        class_ids = class_ids[idx]
+        class_probs = class_probs[idx]
+        idx = idx[0]
+        boxes_idx = idx[:, None], np.arange(4)
+        boxes = boxes[boxes_idx]
+
+        # Decode detected boxes
+        bboxes = []
+        h, w, _ = image.shape
+        num_boxes = len(boxes)
+        for i in range(num_boxes):
+            class_id = class_ids[i]
+            class_name = classes[class_id]
+            box  = [float(v) for v in boxes[i]]
+            center_x, center_y, width, height = box
+            w2 = width / 2
+            h2 = height / 2
+            box[0] = center_x - w2
+            box[1] = center_y - h2
+            box[2] = center_x + w2
+            box[3] = center_y + h2
+            box = box * (np.array([w, h, w, h]) / self.input_size[0]) 
+            (xmin, ymin, xmax, ymax) = box.astype("int")
+            bbox = SnpxBbox(class_name, class_id, [xmin, ymin, xmax, ymax], conf[i])
+            bboxes.append(bbox)
+
+        # Non-max suppression
+        bboxes = non_max_suppression(bboxes, self.nms_iou_thresh)
+        return bboxes
+
+def draw_bbox(img, box, box_tag, box_color, tag_pos='left'):
+    """ draw a single bounding box on the image """
+    xmin, ymin, xmax, ymax = box
+
+    h, w, _ = img.shape
+    font_scale = 0.5
+    thick = 2
+    text_thick = 2
+    left_margin, right_margin, vert_margin = 8, 8, 8
+    font_face = cv2.FONT_HERSHEY_SIMPLEX
+
+    # Draw the Bounding Box
+    cv2.rectangle(img, (xmin, ymin), (xmax, ymax), box_color, thick)
+
+    # Put a Text Box for the box category and confidence score
+    (text_w, text_h), _ = cv2.getTextSize(box_tag, font_face, font_scale, text_thick)
+    text_w += left_margin + right_margin 
+    text_h += 2 * vert_margin
+    if tag_pos == 'left':
+        txt_box_pt1 = (xmin, ymin - text_h)
+        txt_box_pt2 = (xmin + text_w, ymin)
+        txt_origin = (xmin+left_margin, ymin-vert_margin)
+    else:
+        txt_box_pt1 = (xmax - text_w, ymin - text_h)
+        txt_box_pt2 = (xmax, ymin)
+        txt_origin = (xmax-(text_w-left_margin), ymin-vert_margin)
+
+    cv2.rectangle(img, txt_box_pt1, txt_box_pt2, box_color, -1)
+    cv2.putText(img, box_tag, txt_origin, font_face, font_scale, 
+                (255, 255, 255), text_thick)
+
+def draw_detections_on_image(img, bboxes=[SnpxBbox()], box_color = (255, 0, 0)):
+    for bbox in bboxes:
+        box_tag = '%s: %.2f%%' %(bbox.box_class, bbox.confidence * 100)
+        draw_bbox(img, bbox.box, box_tag, box_color=box_color, tag_pos='left')
+
+
+##########################################################################################
+
+class OpenVinoInference(object):
+    """ Inference with openvino. """
+    def __init__(self, device_name='MYRIAD', model_name='yolov3_320'):
+        """ """
+        print ('Device: ', device_name)
+
+        # Open Graph File
+        self.input_size = (320, 320)
+        model_xml = model_name + '.xml'
+        model_bin = model_name + '.bin'
+        self._postprocessor = TFYoloV3Postprocessor(0.4, 0.5)
+        if not os.path.exists(model_xml) or not os.path.exists(model_bin): 
+            raise ValueError('OpenVino Model Graph Missing <%s>'%model_xml)
+
+        # Load model.
+        net = IENetwork(model=model_xml, weights=model_bin)
+        plugin = IEPlugin(device=device_name)
+
+        # Validate the existence of all output tensors in the VINO Graph
+        self.input_blob = next(iter(net.inputs))
+        self.output_blobs = net.outputs
+        self.exec_net = plugin.load(network=net)
+        del net
+
+    def _preprocess(self, image):
+        """ """
+        h, w = self.input_size
+        preproc_image = cv2.resize(image, (w,h))
+        preproc_image = cv2.cvtColor(preproc_image, cv2.COLOR_BGR2RGB)
+        preproc_image = preproc_image.transpose((2, 0, 1))
+        preproc_image = preproc_image.astype(np.float32)
+        preproc_image *= 0.00392
+        return preproc_image
+
+    def infer(self, image):
+        """ """
+        preproc_image = self._preprocess(image)
+        preproc_image = np.expand_dims(preproc_image, 0)
+        infer_req_hdl = self.exec_net.start_async(request_id=0, 
+                                                inputs={self.input_blob: preproc_image})                                       
+        infer_req_hdl.wait()
+        outputs = infer_req_hdl.outputs
+        out = [outputs[out] for out in self.output_blobs]
+        bboxes = self._postprocessor(image, out)
+        return bboxes
+    
+    def close(self):
+        """ """
+        del self.exec_net        
+
+
+def main():
+    """ """
+    image_file = 'dog.jpg'
+    image = cv2.imread(image_file)
+    yolov3 = OpenVinoInference()#(device_name='GPU')
+    bboxes = yolov3.infer(image)
+    draw_detections_on_image(image, bboxes)
+    cv2.imshow('Yolov3 Output', image)
+    cv2.waitKey()
+
+if __name__ == '__main__':
+    main()
